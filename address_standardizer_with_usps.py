@@ -5,34 +5,26 @@ address_standardizer_with_usps.py
 Ready-to-run Python script to standardize U.S. mailing addresses into a consistent,
 CMS-like format, with optional USPS Address Validation (Verify API) integration.
 
-Features:
-- Local normalization heuristics (uppercasing, suffix/directional/state/ZIP normalization).
-- Optional USPS Verify API call to get USPS-canonicalized address fields (Address1,
-  Address2, City, State, Zip5, Zip4).
-- Safe fallback to local normalization when USPS is unavailable or returns an error.
-- CSV input/output processing with configurable column names.
-- CLI options for USPS USERID (or read from USPS_USERID env var), throttling, and test mode.
-- Minimal external dependency: will use `requests` if available, otherwise uses stdlib urllib.
+Modifications (2026-01-28):
+- Preserve all original input CSV columns in the output (they are not dropped).
+  The script now appends standardized columns (prefixed with `std_`) to the
+  output CSV so original input stays intact.
+- Add ability to parse a full address contained in a single input column into
+  components (street, unit, city, state, zip) via the --single-address-column CLI option.
+  Parsing is heuristic-based and will be followed by local normalization and
+  optional USPS Verify where configured.
 
-Notes:
-- USPS Web Tools API requires a USERID. Obtain one from https://www.usps.com/business/web-tools-apis/
-  and provide it via --usps-userid or the USPS_USERID environment variable.
-- USPS AddressVerify expects Address1 (secondary) and Address2 (primary street). This script maps:
-    - CSV "address1" -> USPS Address2 (street)
-    - CSV "address2" -> USPS Address1 (secondary / unit)
-- This script is intended for batch normalization + USPS canonicalization, not for real-time production
-  without respecting USPS Web Tools terms and rate limits.
-
-Usage:
+Usage examples:
     python address_standardizer_with_usps.py input.csv output.csv --usps-userid YOUR_USERID
+    python address_standardizer_with_usps.py input.csv output.csv --single-address-column "full_address"
     python address_standardizer_with_usps.py --test
     python address_standardizer_with_usps.py input.csv output.csv --no-usps
 
 Author: Copilot-style assistant for Code4Dayzzz
-Date: 2026-01-21
+Date: 2026-01-21 (modified 2026-01-28)
 """
 
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 import re
 import csv
 import sys
@@ -110,6 +102,7 @@ UNIT_DESIGNATORS = [
 NON_ALNUM_RE = re.compile(r"[^\w\s#-]")
 MULTISPACE_RE = re.compile(r"\s+")
 POBOX_RE = re.compile(r"\bP\.?O\.?\s*BOX\b", re.IGNORECASE)
+ZIP_RE = re.compile(r"\d{5}(?:-\d{4})?$")
 
 # ---------- Local normalization helpers ----------
 
@@ -237,6 +230,124 @@ def standardize_address_components_local(
 
     return {"address1": a1, "address2": a2, "city": c, "state": st, "zip": z}
 
+# ---------- Heuristic parsing of a full-address column ----------
+
+def parse_full_address(full: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Heuristically parse a full address text into (street, unit, city, state, zip).
+    Returns tuple where missing parts are empty strings.
+    This is not perfect but handles many common forms:
+      - "123 Main St Apt 4B, Anytown, CA 90210"
+      - "123 Main St, Anytown CA 90210"
+      - "PO Box 123, Post Office, NY 12345"
+      - "123 Main St Apt 4B Anytown, NY 12345"
+    """
+    if not full:
+        return None, None, None, None, None
+    s = full.strip()
+    # Normalize separators
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = MULTISPACE_RE.sub(" ", s).strip()
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+
+    street = ""
+    unit = ""
+    city = ""
+    state = ""
+    zipc = ""
+
+    try:
+        if len(parts) >= 3:
+            # common: street, city, state zip
+            street_part = ", ".join(parts[:-2])
+            city_part = parts[-2]
+            state_zip_part = parts[-1]
+            # Extract zip if present
+            m_zip = re.search(r"(\d{5}(?:-\d{4})?)\b", state_zip_part)
+            if m_zip:
+                zipc = m_zip.group(1)
+                state_part = state_zip_part[:m_zip.start()].strip()
+            else:
+                state_part = state_zip_part.strip()
+            street_candidate, unit_candidate = extract_unit(street_part.upper())
+            street = street_candidate
+            unit = unit_candidate or ""
+            city = city_part
+            state = state_part
+        elif len(parts) == 2:
+            # Could be "street, city state zip" or "street, citystatezip"
+            street_part = parts[0]
+            right = parts[1]
+            # Try to extract zip at end
+            m_zip = re.search(r"(\d{5}(?:-\d{4})?)\b", right)
+            if m_zip:
+                zipc = m_zip.group(1)
+                without_zip = right[:m_zip.start()].strip()
+            else:
+                without_zip = right
+            # Now assume last token is state, rest is city
+            tokens = without_zip.split()
+            if tokens:
+                state_candidate = tokens[-1]
+                city_candidate = " ".join(tokens[:-1]).strip()
+                # If state candidate is long (like 'New'), try to use fallback
+                state = state_candidate
+                city = city_candidate
+            else:
+                city = without_zip
+                state = ""
+            street_candidate, unit_candidate = extract_unit(street_part.upper())
+            street = street_candidate
+            unit = unit_candidate or ""
+        else:
+            # No commas: try to extract via zip at end and then state token before it
+            m_zip = re.search(r"(\d{5}(?:-\d{4})?)\b", s)
+            if m_zip:
+                zipc = m_zip.group(1)
+                before_zip = s[:m_zip.start()].strip()
+            else:
+                before_zip = s
+            # split before_zip into tokens and assume last token is state, previous tokens form city or street
+            # We'll try to detect digits (street number) to separate street from city/state
+            tokens = before_zip.split()
+            # find index of first token that contains a digit - likely street number
+            idx_num = None
+            for i, t in enumerate(tokens):
+                if re.search(r"\d", t):
+                    idx_num = i
+                    break
+            if idx_num is None:
+                # fallback - everything is street
+                street = before_zip
+            else:
+                # find a split point for street vs city/state: we'll try to find where a token starts with a letter and then uppercase token might be city
+                # Rough heuristic: if there is a token that's purely alpha and next token is a 2-letter token, treat last two as state
+                # Simpler: assume last two tokens are city/state if last token is 2-letter or full state name
+                if len(tokens) >= 3 and (len(tokens[-1]) == 2 or tokens[-1].isalpha()):
+                    # assume last token is state, previous tokens after the street form city
+                    state = tokens[-1]
+                    # find where city starts: attempt to find token after the street number sequence ends
+                    # assume street runs until a token that starts with letter and no digits and is title-like, but it's heuristic
+                    # We'll take everything before the last two tokens as street+city, then split first contiguous numeric token region as street
+                    street = " ".join(tokens[:len(tokens)-2])
+                    city = ""
+                else:
+                    # fallback
+                    street = before_zip
+    except Exception:
+        # On any unexpected parsing failure, return Nones to indicate no parse
+        return None, None, None, None, None
+
+    # Final cleanup
+    street = street.strip() if street else ""
+    unit = unit.strip() if unit else ""
+    city = city.strip() if city else ""
+    state = state.strip() if state else ""
+    zipc = zipc.strip() if zipc else ""
+
+    return street, unit, city, state, zipc
+
 # ---------- USPS API integration ----------
 
 USPS_API_URL = "https://secure.shippingapis.com/ShippingAPI.dll"
@@ -349,7 +460,6 @@ def call_usps_verify(userid: str, street: str, secondary: str, city: str, state:
     return True, standardized, None
 
 # ---------- CSV Processing with optional USPS ----------
-
 def process_csv_with_usps(
     input_path: str,
     output_path: str,
@@ -357,26 +467,55 @@ def process_csv_with_usps(
     userid: Optional[str],
     throttle_ms: int = 200,
     columns: Optional[Tuple[str, ...]] = None,
+    single_address_column: Optional[str] = None,
 ) -> None:
     """
     Process CSV, attempt USPS verification for each row if enabled and USERID provided.
     columns tuple: (address1,address2,city,state,zip). If None, defaults to these names.
+    Output preserves all original columns and appends standardized columns prefixed with "std_".
+    If single_address_column is provided, the script will attempt to parse that column
+    heuristically into address components before normalization/USPS call.
     """
     if columns is None:
         columns = ("address1", "address2", "city", "state", "zip")
 
     with open(input_path, newline="", encoding="utf-8") as inf, open(output_path, "w", newline="", encoding="utf-8") as outf:
         reader = csv.DictReader(inf)
-        fieldnames = list(columns)
-        writer = csv.DictWriter(outf, fieldnames=fieldnames)
+        input_fieldnames = reader.fieldnames or []
+        # create standardized field names that won't collide with existing names
+        std_fields = []
+        for c in columns:
+            std_name = f"std_{c}"
+            # if collision, append numeric suffix
+            suffix = 1
+            base = std_name
+            while std_name in input_fieldnames:
+                std_name = f"{base}_{suffix}"
+                suffix += 1
+            std_fields.append(std_name)
+        out_fieldnames = list(input_fieldnames) + std_fields
+        writer = csv.DictWriter(outf, fieldnames=out_fieldnames)
         writer.writeheader()
 
         for i, row in enumerate(reader, start=1):
+            # Prepare raw inputs. If user provided a single-column to parse, attempt that
             raw_a1 = row.get(columns[0], "")
             raw_a2 = row.get(columns[1], "") if columns[1] in row else ""
             raw_city = row.get(columns[2], "")
             raw_state = row.get(columns[3], "")
             raw_zip = row.get(columns[4], "")
+
+            if single_address_column and single_address_column in row and row.get(single_address_column):
+                parsed = parse_full_address(row.get(single_address_column))
+                if parsed and any(parsed):
+                    p_street, p_unit, p_city, p_state, p_zip = parsed
+                    # If parsed yields values, prefer them over the existing raw fields when non-empty
+                    raw_a1 = p_street or raw_a1
+                    # if parsed unit exists and address2 is empty, use parsed unit
+                    raw_a2 = p_unit or raw_a2
+                    raw_city = p_city or raw_city
+                    raw_state = p_state or raw_state
+                    raw_zip = p_zip or raw_zip
 
             # First apply local normalization
             local_norm = standardize_address_components_local(raw_a1, raw_a2, raw_city, raw_state, raw_zip)
@@ -393,32 +532,45 @@ def process_csv_with_usps(
                 )
                 if usps_ok:
                     # Merge: prefer USPS fields when present; fall back to local if empty
-                    out = {
-                        "address1": usps_result.get("address1") or local_norm["address1"],
-                        "address2": usps_result.get("address2") or local_norm["address2"],
-                        "city": usps_result.get("city") or local_norm["city"],
-                        "state": usps_result.get("state") or local_norm["state"],
-                        "zip": usps_result.get("zip") or local_norm["zip"],
+                    out_std = {
+                        f"std_{columns[0]}": usps_result.get("address1") or local_norm["address1"],
+                        f"std_{columns[1]}": usps_result.get("address2") or local_norm["address2"],
+                        f"std_{columns[2]}": usps_result.get("city") or local_norm["city"],
+                        f"std_{columns[3]}": usps_result.get("state") or local_norm["state"],
+                        f"std_{columns[4]}": usps_result.get("zip") or local_norm["zip"],
                     }
                 else:
                     # On USPS failure, keep local_norm and optionally log error to stderr
                     print(f"Row {i}: USPS failed: {usps_err}", file=sys.stderr)
-                    out = local_norm
+                    out_std = {
+                        f"std_{columns[0]}": local_norm["address1"],
+                        f"std_{columns[1]}": local_norm["address2"],
+                        f"std_{columns[2]}": local_norm["city"],
+                        f"std_{columns[3]}": local_norm["state"],
+                        f"std_{columns[4]}": local_norm["zip"],
+                    }
                 # Throttle between API calls to avoid rate limits
                 if throttle_ms > 0:
                     time.sleep(throttle_ms / 1000.0)
             else:
-                out = local_norm
+                out_std = {
+                    f"std_{columns[0]}": local_norm["address1"],
+                    f"std_{columns[1]}": local_norm["address2"],
+                    f"std_{columns[2]}": local_norm["city"],
+                    f"std_{columns[3]}": local_norm["state"],
+                    f"std_{columns[4]}": local_norm["zip"],
+                }
 
-            writer.writerow({
-                columns[0]: out["address1"],
-                columns[1]: out["address2"],
-                columns[2]: out["city"],
-                columns[3]: out["state"],
-                columns[4]: out["zip"],
-            })
+            # Compose output row: preserve original values, append standardized ones
+            out_row = dict(row)  # copy original columns
+            # Ensure the standardized field names match the writer's header (handle collisions as earlier)
+            # Because we computed std_fields earlier possibly with suffixes, map std_fields to columns order
+            for idx, c in enumerate(columns):
+                std_colname = std_fields[idx]
+                out_row[std_colname] = out_std.get(f"std_{c}", "")
+            writer.writerow(out_row)
 
-# ---------- Small test harness demonstrating USPS integration ----------
+# ---------- Small test harness demonstrating USPS integration and parsing ----------
 
 TEST_CASES = [
     ("123 Main Street", "", "Anytown", "New York", "12345"),
@@ -429,28 +581,43 @@ TEST_CASES = [
     ("742 Evergreen Terrace", "", "Springfield", "illinois", "62704"),
     ("1600 Pennsylvania Ave NW", "", "Washington", "district of columbia", "20500"),
     ("500 S HIGHWAY 101", "UNIT 3", "Coastal", "oregon", "97101-1234"),
+    # Full-address single column cases for parser testing
+    ("123 Main St Apt 4B, Anytown, CA 90210", None, None, None, None),
+    ("PO Box 123, Post Office, NY 12345", None, None, None, None),
+    ("742 Evergreen Terrace, Springfield IL 62704", None, None, None, None),
 ]
 
 def run_tests(usps_userid: Optional[str] = None, use_usps: bool = False):
     print("Running quick tests...\n")
     print(f"USPS integration enabled: {use_usps}, USERID provided: {'yes' if usps_userid else 'no'}\n")
     for i, (a1, a2, city, state, zipc) in enumerate(TEST_CASES, 1):
-        local = standardize_address_components_local(a1, a2, city, state, zipc)
-        print(f"Case {i}: Input: {a1!r}, {a2!r}, {city!r}, {state!r}, {zipc!r}")
-        print("  Local normalized:", local)
-        if use_usps and usps_userid:
-            ok, usps_res, err = call_usps_verify(
-                usps_userid,
-                street=local["address1"],
-                secondary=local["address2"],
-                city=local["city"],
-                state=local["state"],
-                zip_code=local["zip"],
-            )
-            if ok:
-                print("  USPS result:", usps_res)
+        if city is None and state is None and zipc is None and a2 is None:
+            # interpret a1 as single-column full address to parse
+            print(f"Case {i} (single-column parse): Input: {a1!r}")
+            parsed = parse_full_address(a1)
+            print("  Parsed:", parsed)
+            if any(parsed):
+                local = standardize_address_components_local(parsed[0] or "", parsed[1] or "", parsed[2] or "", parsed[3] or "", parsed[4] or "")
             else:
-                print("  USPS error:", err)
+                local = {"address1":"", "address2":"", "city":"", "state":"", "zip":""}
+            print("  Local normalized:", local)
+        else:
+            local = standardize_address_components_local(a1, a2, city, state, zipc)
+            print(f"Case {i}: Input: {a1!r}, {a2!r}, {city!r}, {state!r}, {zipc!r}")
+            print("  Local normalized:", local)
+            if use_usps and usps_userid:
+                ok, usps_res, err = call_usps_verify(
+                    usps_userid,
+                    street=local["address1"],
+                    secondary=local["address2"],
+                    city=local["city"],
+                    state=local["state"],
+                    zip_code=local["zip"],
+                )
+                if ok:
+                    print("  USPS result:", usps_res)
+                else:
+                    print("  USPS error:", err)
         print()
 
 # ---------- CLI ----------
@@ -458,12 +625,13 @@ def run_tests(usps_userid: Optional[str] = None, use_usps: bool = False):
 def main(argv):
     p = argparse.ArgumentParser(description="Standardize US mailing addresses (with optional USPS Verify API).")
     p.add_argument("input", nargs="?", help="Input CSV file (default: stdin)", default=None)
-    p.add_argument("output", nargs="?", help="Output CSV file (default: stdout)", default=None)
+    p.add_argument("output", nargs="?", help="Output CSV file (default: stdout or standardized_output.csv)", default=None)
     p.add_argument("--columns", help="Comma-separated input column names in order: address1,address2,city,state,zip", default=None)
     p.add_argument("--usps-userid", help="USPS Web Tools USERID (can also be set via USPS_USERID env var).", default=None)
     p.add_argument("--no-usps", dest="use_usps", action="store_false", help="Do not call the USPS API (use local normalization only).")
     p.add_argument("--throttle-ms", type=int, default=200, help="Milliseconds to sleep between USPS calls (default: 200).")
     p.add_argument("--test", action="store_true", help="Run built-in tests and exit")
+    p.add_argument("--single-address-column", help="Column name that contains a full address to parse into components (heuristic parsing).", default=None)
     args = p.parse_args(argv)
 
     columns = tuple(c.strip() for c in args.columns.split(",")) if args.columns else None
@@ -481,15 +649,40 @@ def main(argv):
     if not args.input or args.input == "-":
         # Read from stdin, write to stdout
         reader = csv.DictReader(sys.stdin)
-        fieldnames = list(columns) if columns else ["address1", "address2", "city", "state", "zip"]
-        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        input_fieldnames = reader.fieldnames or []
+        # determine columns used for normalization
+        if columns is None:
+            columns = ("address1", "address2", "city", "state", "zip")
+        # build standardized fieldnames, avoiding collisions
+        std_fields = []
+        for c in columns:
+            std_name = f"std_{c}"
+            suffix = 1
+            base = std_name
+            while std_name in input_fieldnames:
+                std_name = f"{base}_{suffix}"
+                suffix += 1
+            std_fields.append(std_name)
+        out_fieldnames = list(input_fieldnames) + std_fields
+        writer = csv.DictWriter(sys.stdout, fieldnames=out_fieldnames)
         writer.writeheader()
         for i, row in enumerate(reader, start=1):
-            raw_a1 = row.get(fieldnames[0], "")
-            raw_a2 = row.get(fieldnames[1], "") if fieldnames[1] in row else ""
-            raw_city = row.get(fieldnames[2], "")
-            raw_state = row.get(fieldnames[3], "")
-            raw_zip = row.get(fieldnames[4], "")
+            raw_a1 = row.get(columns[0], "")
+            raw_a2 = row.get(columns[1], "") if columns[1] in row else ""
+            raw_city = row.get(columns[2], "")
+            raw_state = row.get(columns[3], "")
+            raw_zip = row.get(columns[4], "")
+
+            if args.single_address_column and args.single_address_column in row and row.get(args.single_address_column):
+                parsed = parse_full_address(row.get(args.single_address_column))
+                if parsed and any(parsed):
+                    p_street, p_unit, p_city, p_state, p_zip = parsed
+                    raw_a1 = p_street or raw_a1
+                    raw_a2 = p_unit or raw_a2
+                    raw_city = p_city or raw_city
+                    raw_state = p_state or raw_state
+                    raw_zip = p_zip or raw_zip
+
             local_norm = standardize_address_components_local(raw_a1, raw_a2, raw_city, raw_state, raw_zip)
             if use_usps and usps_userid:
                 ok, usps_res, err = call_usps_verify(
@@ -501,39 +694,51 @@ def main(argv):
                     zip_code=local_norm["zip"],
                 )
                 if ok:
-                    out = {
-                        fieldnames[0]: usps_res.get("address1") or local_norm["address1"],
-                        fieldnames[1]: usps_res.get("address2") or local_norm["address2"],
-                        fieldnames[2]: usps_res.get("city") or local_norm["city"],
-                        fieldnames[3]: usps_res.get("state") or local_norm["state"],
-                        fieldnames[4]: usps_res.get("zip") or local_norm["zip"],
+                    out_std_vals = {
+                        std_fields[0]: usps_res.get("address1") or local_norm["address1"],
+                        std_fields[1]: usps_res.get("address2") or local_norm["address2"],
+                        std_fields[2]: usps_res.get("city") or local_norm["city"],
+                        std_fields[3]: usps_res.get("state") or local_norm["state"],
+                        std_fields[4]: usps_res.get("zip") or local_norm["zip"],
                     }
                 else:
                     print(f"Row {i}: USPS failed: {err}", file=sys.stderr)
-                    out = {
-                        fieldnames[0]: local_norm["address1"],
-                        fieldnames[1]: local_norm["address2"],
-                        fieldnames[2]: local_norm["city"],
-                        fieldnames[3]: local_norm["state"],
-                        fieldnames[4]: local_norm["zip"],
+                    out_std_vals = {
+                        std_fields[0]: local_norm["address1"],
+                        std_fields[1]: local_norm["address2"],
+                        std_fields[2]: local_norm["city"],
+                        std_fields[3]: local_norm["state"],
+                        std_fields[4]: local_norm["zip"],
                     }
                 if args.throttle_ms > 0:
                     time.sleep(args.throttle_ms / 1000.0)
             else:
-                out = {
-                    fieldnames[0]: local_norm["address1"],
-                    fieldnames[1]: local_norm["address2"],
-                    fieldnames[2]: local_norm["city"],
-                    fieldnames[3]: local_norm["state"],
-                    fieldnames[4]: local_norm["zip"],
+                out_std_vals = {
+                    std_fields[0]: local_norm["address1"],
+                    std_fields[1]: local_norm["address2"],
+                    std_fields[2]: local_norm["city"],
+                    std_fields[3]: local_norm["state"],
+                    std_fields[4]: local_norm["zip"],
                 }
-            writer.writerow(out)
+
+            out_row = dict(row)
+            for idx, c in enumerate(columns):
+                out_row[std_fields[idx]] = out_std_vals.get(std_fields[idx], "")
+            writer.writerow(out_row)
         return 0
 
     # Files provided
     input_path = args.input
     output_path = args.output or "standardized_output.csv"
-    process_csv_with_usps(input_path, output_path, use_usps=use_usps and bool(usps_userid), userid=usps_userid, throttle_ms=args.throttle_ms, columns=columns)
+    process_csv_with_usps(
+        input_path,
+        output_path,
+        use_usps=use_usps and bool(usps_userid),
+        userid=usps_userid,
+        throttle_ms=args.throttle_ms,
+        columns=columns,
+        single_address_column=args.single_address_column,
+    )
     print(f"Wrote standardized addresses to {output_path}")
     return 0
 
